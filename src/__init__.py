@@ -1,3 +1,4 @@
+from .cache import MovieCache
 from .models import (
     HealthResponse,
     MovieDataResponse,

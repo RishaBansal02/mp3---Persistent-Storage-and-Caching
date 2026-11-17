@@ -34,3 +34,6 @@ uvicorn==0.39.0
 uvloop==0.23.0
 watchfiles==1.1.1
 websockets==15.0.1
+fakeredis==2.31.3
+redis==6.4.0
+sortedcontainers==2.4.0

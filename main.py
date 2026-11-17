@@ -1,9 +1,11 @@
 import io
 import logging
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from data_pipeline import (
     create_cleaning_report,
@@ -12,6 +14,7 @@ from data_pipeline import (
 )
 from src import (
     HealthResponse,
+    MovieCache,
     MovieDataResponse,
     MovieProcessingReport,
     MovieStorage,
@@ -29,6 +32,15 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Data Processing API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
+movies_lock = Lock()
+
+
+def save_movies(df):
+    """Replace the collection and invalidate its cached responses."""
+    with movies_lock:
+        storage.save(df)
+        cache.invalidate()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -77,7 +89,7 @@ async def upload_movies(file: UploadFile = File(...)):
         )
 
     df = df[MOVIE_COLUMNS]
-    storage.save(df)
+    await run_in_threadpool(save_movies, df)
 
     logger.info("Uploaded movies: filename=%s, rows=%s", filename, len(df))
 
@@ -92,16 +104,23 @@ async def upload_movies(file: UploadFile = File(...)):
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
     """Return up to limit movies and the total collection size."""
-    records = storage.select_columns(MOVIE_COLUMNS, limit)
-    total_rows = storage.count_movies()
+    with movies_lock:
+        cached = cache.get(limit)
+        if cached is not None:
+            logger.info("Movie cache hit: limit=%s", limit)
+            return cached
+
+        records = storage.select_columns(MOVIE_COLUMNS, limit)
+        total_rows = storage.count_movies()
+        response = MovieDataResponse(data=records, total_rows=total_rows)
+        cache.set(limit, response.model_dump())
 
     logger.info(
         "Retrieved movies: returned_rows=%s, total_rows=%s",
         len(records),
         total_rows,
     )
-
-    return MovieDataResponse(data=records, total_rows=total_rows)
+    return response
 
 
 @app.get("/movies/search", response_model=list[dict])
@@ -129,53 +148,55 @@ def search_movies(
 @app.post("/movies/process", response_model=MovieProcessingReport)
 def process_movies(config: ProcessConfig):
     """Validate, clean, and save the current movie collection."""
-    df = storage.get()
+    with movies_lock:
+        df = storage.get()
 
-    if df.empty:
-        raise HTTPException(
-            status_code=400,
-            detail="No movies to process. Upload a movie CSV first.",
-        )
-
-    config_dict = config.model_dump()
-
-    try:
-        required_columns = config.validation.required_columns
-        numeric_columns = config.validation.numeric_columns
-
-        for column in numeric_columns:
-            if column not in df.columns:
-                raise ValueError(f"Numeric column not found: {column}")
-
-        validated_df = validate_dataframe(df, required_columns, numeric_columns)
-        validation_rows_removed = len(df) - len(validated_df)
-        validated_copy = validated_df.copy()
-
-        processed_df = process_data(validated_df, config_dict)
-        cleaning_report = create_cleaning_report(validated_copy, processed_df)
-
-        missing_columns = [
-            column for column in MOVIE_COLUMNS if column not in processed_df.columns
-        ]
-        if missing_columns:
-            raise ValueError(
-                f"Processing removed required movie columns: {', '.join(missing_columns)}"
+        if df.empty:
+            raise HTTPException(
+                status_code=400,
+                detail="No movies to process. Upload a movie CSV first.",
             )
 
-    except ValueError as error:
-        logger.warning("Movie processing failed: %s", error)
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        config_dict = config.model_dump()
 
-    storage.save(processed_df)
+        try:
+            required_columns = config.validation.required_columns
+            numeric_columns = config.validation.numeric_columns
 
-    logger.info(
-        "Processed movies: validation_removed=%s, rows_before=%s, rows_after=%s",
-        validation_rows_removed,
-        len(validated_copy),
-        len(processed_df),
-    )
+            for column in numeric_columns:
+                if column not in df.columns:
+                    raise ValueError(f"Numeric column not found: {column}")
 
-    return MovieProcessingReport(
-        validation_rows_removed=validation_rows_removed,
-        cleaning_report=cleaning_report,
-    )
+            validated_df = validate_dataframe(df, required_columns, numeric_columns)
+            validation_rows_removed = len(df) - len(validated_df)
+            validated_copy = validated_df.copy()
+
+            processed_df = process_data(validated_df, config_dict)
+            cleaning_report = create_cleaning_report(validated_copy, processed_df)
+
+            missing_columns = [
+                column for column in MOVIE_COLUMNS if column not in processed_df.columns
+            ]
+            if missing_columns:
+                raise ValueError(
+                    f"Processing removed required movie columns: {', '.join(missing_columns)}"
+                )
+
+        except ValueError as error:
+            logger.warning("Movie processing failed: %s", error)
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+        storage.save(processed_df)
+        cache.invalidate()
+
+        logger.info(
+            "Processed movies: validation_removed=%s, rows_before=%s, rows_after=%s",
+            validation_rows_removed,
+            len(validated_copy),
+            len(processed_df),
+        )
+
+        return MovieProcessingReport(
+            validation_rows_removed=validation_rows_removed,
+            cleaning_report=cleaning_report,
+        )
